@@ -27,7 +27,10 @@ from troposphere import Template
 def cli(context, region):
     """ Troposphere CLI.
     """
-    context.obj = boto3.client('cloudformation', region_name=region)
+    context.obj = {
+        'cloudformation': boto3.client('cloudformation', region_name=region),
+        's3': boto3.client('s3', region_name=region),
+    }
 
 
 STATUSES = [
@@ -50,17 +53,17 @@ STATUSES = [
 ]
 
 
-@cli.command()
+@cli.command('list')
 @click.option('--all', is_flag=True)
 @click.pass_obj
-def list(client, all):
+def list_stacks(clients, show_all):
     """ List stacks.
     """
     statuses = STATUSES.copy()
-    if not all:
+    if not show_all:
         statuses.remove('DELETE_COMPLETE')
 
-    stacks = client.list_stacks(
+    stacks = clients['cloudformation'].list_stacks(
         StackStatusFilter=statuses,
     )
     for stack in stacks.get('StackSummaries'):
@@ -69,27 +72,27 @@ def list(client, all):
         )
 
 
-def _events(client, name):
+def _events(clients, name):
     now = utc.localize(datetime.utcnow())
     seen = set()
 
     while True:
         status = (
-            client.describe_stacks(StackName=name)
+            clients['cloudformation'].describe_stacks(StackName=name)
             .get('Stacks')[0]
             .get('StackStatus')
         )
 
-        events = client.describe_stack_events(StackName=name)
+        events = clients['cloudformation'].describe_stack_events(StackName=name)
 
         for event in reversed(events.get('StackEvents')):
-            id = event.get('EventId')
+            event_id = event.get('EventId')
             timestamp = event.get('Timestamp')
 
             if timestamp < now - timedelta(seconds=2):
                 continue
 
-            if id not in seen:
+            if event_id not in seen:
                 message = (
                     "%(Timestamp)s [ %(LogicalResourceId)-20s ] "
                     % event +
@@ -103,7 +106,7 @@ def _events(client, name):
 
                 click.echo(message)
 
-            seen.add(id)
+            seen.add(event_id)
 
         if status.endswith('COMPLETE'):
             break
@@ -111,10 +114,10 @@ def _events(client, name):
         time.sleep(1)
 
 
-@cli.command()
+@cli.command('events')
 @click.argument('name')
 @click.pass_obj
-def events(*args, **kwargs):
+def stack_events(*args, **kwargs):
     """ Display stack events.
     """
     return _events(*args, **kwargs)
@@ -128,11 +131,11 @@ def events(*args, **kwargs):
     help="Output the value for given key.",
 )
 @click.pass_obj
-def outputs(client, name, key=None):
+def outputs(clients, name, key=None):
     """ Show stack output values.
     """
     for output in (
-        client.describe_stacks(StackName=name)
+        clients['cloudformation'].describe_stacks(StackName=name)
         .get('Stacks')[0]
         .get('Outputs')
     ):
@@ -148,8 +151,8 @@ def outputs(client, name, key=None):
         )
 
 
-def _parameters(client, name):
-    stack = client.describe_stacks(StackName=name).get('Stacks')[0]
+def _parameters(clients, name):
+    stack = clients['cloudformation'].describe_stacks(StackName=name).get('Stacks')[0]
     assert stack.get('StackStatus') not in (
         'DELETE_COMPLETE',
     )
@@ -163,11 +166,11 @@ def _parameters(client, name):
 @cli.command()
 @click.argument('name')
 @click.pass_obj
-def parameters(client, name):
+def parameters(clients, name):
     """ Show templates parameter values.
     """
     try:
-        for key, value in _parameters(client, name).items():
+        for key, value in _parameters(clients, name).items():
             click.echo(
                 "%(key)-35s: %(value)-30s" % dict(key=key, value=value)
             )
@@ -191,9 +194,9 @@ def _template(path):
     return path
 
 
-@cli.command()
+@cli.command('template')
 @click.argument('template', envvar='STACK_TEMPLATE')
-def template(template):
+def template_to_json(template):
     """ Show template as json.
     """
     template = _template(template)
@@ -232,6 +235,13 @@ def manage(command):
         is_flag=True,
         help="Show stack events.",
     )
+    @click.option(
+        '--bucket',
+        '-b',
+        envvar='AWS_TEMPLATE_BUCKET',
+        required=True,
+        help="Name of the template bucket.",
+    )
     @click.argument('name')
     @click.pass_obj
     def f(*args, **kwargs):
@@ -245,17 +255,17 @@ def manage(command):
 
 
 def update_params(template, params, previous):
-    parameters = {
+    parameters_dict = {
         key: None
         for key in template.parameters
     }
-    parameters.update(
+    parameters_dict.update(
         {key: value for key, value in params},
     )
 
     params = []
 
-    for key, value in parameters.items():
+    for key, value in parameters_dict.items():
         if value is None and key not in previous:
             continue
 
@@ -275,18 +285,32 @@ def update_params(template, params, previous):
     return params
 
 
-def stack_definition(client, template, name, parameter, capability):
+def upload_template_to_s3(s3_client, stack_name, template, template_bucket):
+    template_key = f'{stack_name}.template'
+    template = template.encode('utf-8')
+    s3_client.put_object(Body=template, Bucket=template_bucket, Key=template_key)
+
+    bucket_location = s3_client.get_bucket_location(Bucket=template_bucket)
+    bucket_location = bucket_location['LocationConstraint']
+
+    return f'https://s3-{bucket_location}.amazonaws.com/{template_bucket}/{template_key}'
+
+
+def get_stack_definition(clients, template, name, parameter, capability, bucket):
     template = _template(template)
+    template_url = upload_template_to_s3(
+        clients['s3'], name, template.to_json(indent=None), bucket,
+    )
 
     try:
-        previous_params = _parameters(client, name)
+        previous_params = _parameters(clients, name)
 
     except (ClientError, AssertionError):
         previous_params = dict()
 
     definition = dict(
         StackName=name,
-        TemplateBody=template.to_json(indent=None),
+        TemplateURL=template_url,
         Parameters=update_params(template, parameter, previous_params),
     )
 
@@ -298,18 +322,19 @@ def stack_definition(client, template, name, parameter, capability):
 
 @cli.command()
 @manage
-def create(client, *args, **kwargs):
+def create(clients, *args, **kwargs):
     """ Create a new stack.
     """
-    client.create_stack(**stack_definition(client, *args, **kwargs))
+    clients['cloudformation'].create_stack(**get_stack_definition(clients, *args, **kwargs))
 
 
 @cli.command()
 @manage
-def update(client, *args, **kwargs):
+def update(clients, *args, **kwargs):
     """ Update an existing stack.
     """
-    client.update_stack(**stack_definition(client, *args, **kwargs))
+    stack_definition = get_stack_definition(clients, *args, **kwargs)
+    clients['cloudformation'].update_stack(**stack_definition)
 
 
 if __name__ == '__main__':

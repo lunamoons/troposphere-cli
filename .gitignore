@@ -9,3 +9,5 @@ __pycache__
 # Setup
 build/
 dist/
+
+.idea

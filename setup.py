@@ -15,7 +15,7 @@ with open('README.rst', 'r') as f:
           'boto3',
           'click',
           'pytz',
-          'troposphere',
+          'troposphere[policy]',
         ],
         license='MIT',
         entry_points=dict(
